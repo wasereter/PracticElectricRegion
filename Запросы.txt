@@ -1,0 +1,96 @@
+SELECT * FROM culture_data.culture_palaces_clubs 
+WHERE "data.general.address.fullAddress" NOT LIKE '%Вологодск%';
+
+DELETE FROM culture_data.culture_palaces_clubs 
+WHERE "data.general.address.fullAddress" NOT LIKE '%Вологодск%';
+
+-- Установка расширения PostGIS
+CREATE EXTENSION postgis;
+
+-- Создание колонки geom с типом geometry(Point, 4326)
+ALTER TABLE culture_palaces_clubs ADD COLUMN geom geometry(Point, 4326);
+
+-- Преобразование данных из колонки data.general.address.mapPosition в геометрию
+UPDATE culture_palaces_clubs 
+SET geom = ST_GeomFromGeoJSON("data.general.address.mapPosition")
+WHERE "data.general.address.mapPosition" IS NOT NULL 
+  AND "data.general.address.mapPosition"::text != 'null';
+
+-- Альтернативный вариант, если нужна дополнительная проверка структуры
+UPDATE culture_palaces_clubs 
+SET geom = CASE 
+    WHEN "data.general.address.mapPosition"::jsonb ? 'coordinates' 
+         AND jsonb_typeof("data.general.address.mapPosition"::jsonb->'coordinates') = 'array'
+    THEN ST_GeomFromGeoJSON("data.general.address.mapPosition")
+    ELSE NULL
+END
+WHERE "data.general.address.mapPosition" IS NOT NULL 
+  AND "data.general.address.mapPosition"::text != 'null';
+
+-- Создание таблицы tags с уникальными тегами --
+CREATE TABLE tags (
+    id SERIAL PRIMARY KEY,
+    tag_name VARCHAR(255) NOT NULL UNIQUE,
+    tag_description TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Преобразование JSON-данных и перенос уникальных тегов --
+INSERT INTO tags (tag_name)
+SELECT DISTINCT 
+    jsonb_array_elements_text("data.general.tags"::jsonb) as tag_name
+FROM culture_palaces_clubs
+WHERE "data.general.tags" IS NOT NULL 
+  AND "data.general.tags"::text != 'null'
+  AND jsonb_array_length("data.general.tags"::jsonb) > 0
+ON CONFLICT (tag_name) DO NOTHING;
+
+-- Проверка добавленных тегов --
+SELECT COUNT(*) as total_tags, 
+       COUNT(DISTINCT tag_name) as unique_tags
+FROM tags;
+
+CREATE TABLE m2m_culture_palaces_clubs_tags (
+    id SERIAL PRIMARY KEY,
+    culture_palace_club_id VARCHAR(50) NOT NULL REFERENCES culture_palaces_clubs("data.general.id") ON DELETE CASCADE,
+    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(culture_palace_club_id, tag_id)
+);
+
+-- Заполнение промежуточной таблицы связями
+INSERT INTO m2m_culture_palaces_clubs_tags (culture_palace_club_id, tag_id)
+SELECT DISTINCT
+    cpc."data.general.id" as culture_palace_club_id,
+    t.id as tag_id
+FROM culture_palaces_clubs cpc
+CROSS JOIN LATERAL jsonb_array_elements_text(cpc."data.general.tags"::jsonb) as tag_value
+INNER JOIN tags t ON t.tag_name = tag_value
+WHERE cpc."data.general.tags" IS NOT NULL 
+  AND cpc."data.general.tags"::text != 'null'
+  AND jsonb_array_length(cpc."data.general.tags"::jsonb) > 0
+ON CONFLICT (culture_palace_club_id, tag_id) DO NOTHING;
+
+-- Создание индексов для оптимизации запросов
+
+-- Индекс для поиска по culture_palace_club_id --
+CREATE INDEX idx_m2m_culture_palace_club_id 
+ON m2m_culture_palaces_clubs_tags(culture_palace_club_id);
+
+-- Индекс для поиска по tag_id --
+CREATE INDEX idx_m2m_tag_id 
+ON m2m_culture_palaces_clubs_tags(tag_id);
+
+-- Индекс по дате создания (если нужна сортировка по времени) --
+CREATE INDEX idx_m2m_created_at 
+ON m2m_culture_palaces_clubs_tags(created_at);
+
+-- Составной индекс для часто используемых запросов --
+CREATE INDEX idx_m2m_composite 
+ON m2m_culture_palaces_clubs_tags(culture_palace_club_id, tag_id);
+
+-- Индекс для обратного поиска (тег -> объекты) --
+CREATE INDEX idx_m2m_reverse 
+ON m2m_culture_palaces_clubs_tags(tag_id, culture_palace_club_id);
+
